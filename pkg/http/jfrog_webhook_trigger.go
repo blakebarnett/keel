@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/keel-hq/keel/types"
@@ -14,7 +16,8 @@ import (
 )
 
 const (
-	EnvPrivateRegistry = "PRIVATE_REGISTRY"
+	EnvPrivateRegistry    = "PRIVATE_REGISTRY"
+	EnvCurrentEnvironment = "ENVIRONMENT"
 )
 
 var newJfrogWebhooksCounter = prometheus.NewCounterVec(
@@ -35,7 +38,6 @@ func init() {
    "event_type": "pushed",
    "data": {
      "repo_key":"docker-remote-cache",
-     "event_type":"pushed",
      "path":"library/ubuntu/latest/list.manifest.json",
      "name":"list.manifest.json",
      "sha256":"35c4a2c15539c6c1e4e5fa4e554dac323ad0107d8eb5c582d6ff386b383b7dce",
@@ -114,12 +116,56 @@ func (s *TriggerServer) jfrogHandler(resp http.ResponseWriter, req *http.Request
 		return
 	}
 
+	if strings.Contains(jw.Data.Tag, "sha256:") {
+		resp.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(resp, "data.tag cannot have a digest tag")
+		log.Debug("Received an image via jfrog webhook with a digest as tag, ignoring")
+		return
+	}
+
+	log.WithFields(log.Fields{
+		"Domain":    jw.Domain,
+		"RepoKey":   jw.Data.RepoKey,
+		"ImageName": jw.Data.ImageName,
+		"Tag":       jw.Data.Tag,
+	}).Debug("jfrogWebhook data: ")
+
 	// for every updated tag generating event
 	event := types.Event{}
 	event.CreatedAt = time.Now()
 	event.TriggerName = "jfrog"
 	event.Repository.Tag = jw.Data.Tag
 	event.Repository.Name = jw.Data.ImageName
+
+	repo := jw.Data.RepoKey
+
+	re := regexp.MustCompile(`(?P<Repo>\w+?-?\w+)(?P<Suffix>(-local|-remote)$)`)
+	matches := re.FindStringSubmatch(jw.Data.RepoKey)
+
+	if len(matches) > 0 {
+		i := re.SubexpIndex("Suffix")
+		if i != -1 {
+			suffix := matches[i]
+			log.Debugf("Repository appears to be part of a virtual repo, trimming %s", suffix)
+			repo = matches[re.SubexpIndex("Repo")]
+		}
+	}
+
+	// If ENVIRONMENT is set, use it for the repo if this was a promoted image
+	if curEnv, ok := os.LookupEnv(EnvCurrentEnvironment); ok {
+		if len(curEnv) >= 3 && jw.EventType == "promoted" {
+			log.Debugf("Image was promoted, using current environment repo: %s", curEnv)
+			if curEnv == "production" && repo != "integration" {
+				// We don't want promotions from development to integration.
+				// We have to react to webhooks from the integration repo
+				// because the promotion API only triggers a webhook from the
+				// source repo not the target repo, and no push event for target
+			} else {
+				repo = curEnv
+			}
+		}
+	}
+
 	if privReg, ok := os.LookupEnv(EnvPrivateRegistry); ok {
 		if len(privReg) >= 3 {
 			event.Repository.Name = fmt.Sprintf("%s/%s", privReg, jw.Data.ImageName)
